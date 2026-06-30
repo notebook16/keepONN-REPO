@@ -42,10 +42,45 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+PYTHON_VERSION="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+
+ensure_python_venv() {
+  if python3 -m venv /tmp/keeponn-venv-check-"$$" 2>/dev/null; then
+    rm -rf /tmp/keeponn-venv-check-"$$"
+    return 0
+  fi
+  rm -rf /tmp/keeponn-venv-check-"$$" 2>/dev/null || true
+
+  echo "python3-venv is not installed for Python ${PYTHON_VERSION}."
+  echo "Installing apt package..."
+  apt-get update -qq
+  if apt-get install -y "python${PYTHON_VERSION}-venv" 2>/dev/null \
+    || apt-get install -y python3-venv 2>/dev/null; then
+    if python3 -m venv /tmp/keeponn-venv-check-"$$" 2>/dev/null; then
+      rm -rf /tmp/keeponn-venv-check-"$$"
+      return 0
+    fi
+    rm -rf /tmp/keeponn-venv-check-"$$" 2>/dev/null || true
+  fi
+
+  echo "Could not enable python3 venv. Run manually:" >&2
+  echo "  sudo apt update" >&2
+  echo "  sudo apt install -y python3-venv python3-pip" >&2
+  echo "  # or: sudo apt install -y python${PYTHON_VERSION}-venv" >&2
+  exit 1
+}
+
+ensure_python_venv
+
 # Fix Windows CRLF if repo was edited on Windows
 for f in run.sh deploy.sh keeponn.env.example keeponn.service; do
   [[ -f "$INSTALL_DIR/$f" ]] && sed -i 's/\r$//' "$INSTALL_DIR/$f"
 done
+
+if [[ -d "$INSTALL_DIR/.venv" ]] && [[ ! -x "$INSTALL_DIR/.venv/bin/pip" ]]; then
+  echo "Removing broken virtualenv at $INSTALL_DIR/.venv"
+  rm -rf "$INSTALL_DIR/.venv"
+fi
 
 if [[ ! -d "$INSTALL_DIR/.venv" ]]; then
   echo "Creating virtualenv at $INSTALL_DIR/.venv"
