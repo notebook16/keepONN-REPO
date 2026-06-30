@@ -1,0 +1,16 @@
+[Unit]
+Description=keepONN — re-command discharging-off BMS devices on Redis
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@@SERVICE_USER@@
+WorkingDirectory=@@INSTALL_DIR@@
+Environment=KEEPONN_ENV=@@INSTALL_DIR@@/keeponn.env
+ExecStart=@@INSTALL_DIR@@/run.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
