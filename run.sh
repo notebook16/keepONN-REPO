@@ -17,4 +17,4 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-exec "$PYTHON" "$DIR/keep_onn.py"
+exec "$PYTHON" -u "$DIR/keep_onn.py"

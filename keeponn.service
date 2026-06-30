@@ -8,6 +8,7 @@ Type=simple
 User=@@SERVICE_USER@@
 WorkingDirectory=@@INSTALL_DIR@@
 Environment=KEEPONN_ENV=@@INSTALL_DIR@@/keeponn.env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=@@INSTALL_DIR@@/run.sh
 Restart=on-failure
 RestartSec=10

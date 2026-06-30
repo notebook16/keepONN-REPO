@@ -255,7 +255,7 @@ def apply_set(client: redis.Redis, imei: str) -> bool:
 
 def run_cycle(client: redis.Redis, command_log: dict[str, datetime]) -> dict[str, datetime]:
     cycle_start = now_ist()
-    print(f"Cycle started at {format_ist(cycle_start)} (IST)")
+    print(f"Cycle started at {format_ist(cycle_start)} (IST)", flush=True)
 
     try:
         off_imeis = collect_discharging_off_imeis(client)
@@ -273,7 +273,8 @@ def run_cycle(client: redis.Redis, command_log: dict[str, datetime]) -> dict[str
 
     print(
         f"discharging_off={len(off_imeis)}, eligible={len(eligible)}, "
-        f"skipped_cooldown={skipped_cooldown}"
+        f"skipped_cooldown={skipped_cooldown}",
+        flush=True,
     )
 
     success = 0
@@ -299,7 +300,8 @@ def run_cycle(client: redis.Redis, command_log: dict[str, datetime]) -> dict[str
     label = "would set" if DRY_RUN else "set"
     print(
         f"Cycle finished at {format_ist(now_ist())} (IST): "
-        f"{label}={success}, failed={failed}"
+        f"{label}={success}, failed={failed}",
+        flush=True,
     )
     return command_log
 
@@ -309,9 +311,12 @@ def main() -> int:
     signal.signal(signal.SIGINT, request_shutdown)
 
     mode = "DRY-RUN" if DRY_RUN else "LIVE"
-    print(f"keepONN starting — mode={mode}")
-    print(f"Command log: {COMMAND_LOG_CSV}")
-    print(f"Cooldown: {COOLDOWN_MINUTES} min, loop interval: {LOOP_INTERVAL_SEC}s")
+    print(f"keepONN starting — mode={mode}", flush=True)
+    print(f"Command log: {COMMAND_LOG_CSV}", flush=True)
+    print(
+        f"Cooldown: {COOLDOWN_MINUTES} min, loop interval: {LOOP_INTERVAL_SEC}s",
+        flush=True,
+    )
 
     command_log = load_command_log(COMMAND_LOG_CSV)
 
