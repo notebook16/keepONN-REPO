@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-keepONN daemon: continuously find IMEIs with bms_allow_discharging=false,
-SET discharging_<imei> to status=pending (with cooldown via comman_log.csv).
-
-Runs in a loop (default 60s). Deploy as systemd service via deploy.sh.
+keepONN daemon:
+1) Scan Redis numeric IMEI keys where bms_allow_discharging=false
+2) Filter out IMEIs present in override CSV
+3) Filter out IMEIs absent in fleets.io_t_device_imei
+4) Filter out IMEIs whose latest command_requests row is discharging + command_status=false
+   with created_at newer than configured cutoff
+5) Apply cooldown via comman_log.csv and SET discharging_<imei> status=pending
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
+import psycopg
 import redis
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -27,6 +31,8 @@ NUMERIC_KEY_PATTERN = re.compile(r"^[0-9]+$")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_COMMAND_LOG = SCRIPT_DIR / "data" / "comman_log.csv"
+DEFAULT_OVERRIDE_CSV = SCRIPT_DIR / "data" / "override.csv"
+DEFAULT_FIRED_COMMAND_CSV = SCRIPT_DIR / "data" / "fired_command.csv"
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "65.0.205.125")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
@@ -45,8 +51,23 @@ DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in {"1", "true", "yes"}
 COMMAND_LOG_CSV = Path(
     os.environ.get("COMMAND_LOG_CSV", "").strip() or DEFAULT_COMMAND_LOG
 )
+OVERRIDE_CSV = Path(os.environ.get("OVERRIDE_CSV", "").strip() or DEFAULT_OVERRIDE_CSV)
+FIRED_COMMAND_CSV = Path(
+    os.environ.get("FIRED_COMMAND_CSV", "").strip() or DEFAULT_FIRED_COMMAND_CSV
+)
+
+DB_POSTGRES_URL = os.environ.get("DB_POSTGRES_URL", "127.0.0.1")
+DB_POSTGRES_DBNAME = os.environ.get("DB_POSTGRES_DBNAME", "ac2")
+DB_POSTGRES_USERNAME = os.environ.get("DB_POSTGRES_USERNAME", "postgres")
+DB_POSTGRES_PASS = os.environ.get("DB_POSTGRES_PASS", "")
+DB_POSTGRES_PORT = int(os.environ.get("DB_POSTGRES_PORT", "5432"))
+DB_CONNECT_TIMEOUT_SEC = int(os.environ.get("DB_CONNECT_TIMEOUT_SEC", "10"))
+COMMAND_REQUEST_MIN_CREATED_AT_RAW = os.environ.get(
+    "COMMAND_REQUEST_MIN_CREATED_AT", "2026-06-30T18:29:59Z"
+)
 
 CSV_COLUMNS = ("imei", "timestamp")
+FIRED_COMMAND_COLUMNS = ("imei", "timestamp")
 _shutdown_requested = False
 
 
@@ -56,6 +77,12 @@ def now_ist() -> datetime:
 
 def format_ist(ts: datetime) -> str:
     return ts.isoformat()
+
+
+def normalize_imei(raw: Any) -> str:
+    if raw is None:
+        return ""
+    return str(raw).strip()
 
 
 def request_shutdown(signum: int, _frame: Any) -> None:
@@ -73,6 +100,17 @@ def connect_redis() -> redis.Redis:
         decode_responses=True,
         socket_timeout=SOCKET_TIMEOUT_SEC,
         socket_connect_timeout=SOCKET_TIMEOUT_SEC,
+    )
+
+
+def connect_postgres() -> psycopg.Connection:
+    return psycopg.connect(
+        host=DB_POSTGRES_URL,
+        dbname=DB_POSTGRES_DBNAME,
+        user=DB_POSTGRES_USERNAME,
+        password=DB_POSTGRES_PASS,
+        port=DB_POSTGRES_PORT,
+        connect_timeout=DB_CONNECT_TIMEOUT_SEC,
     )
 
 
@@ -123,8 +161,35 @@ def extract_bms_allow_discharging(raw: str | None) -> bool | None:
     return None
 
 
-def collect_discharging_off_imeis(client: redis.Redis) -> list[str]:
+def extract_soc(raw: str | None) -> float | None:
+    if not raw:
+        return None
+    try:
+        payload: Any = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    numeric_io = payload.get("numeric_io_data")
+    if not isinstance(numeric_io, dict):
+        return None
+
+    value = numeric_io.get("soc")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed:
+            return None
+        try:
+            return float(trimmed)
+        except ValueError:
+            return None
+    return None
+
+
+def collect_discharging_off_imeis(client: redis.Redis) -> tuple[list[str], list[str]]:
     off_imeis: list[str] = []
+    skipped_soc_zero_imeis: list[str] = []
     for key_batch in chunked(iter_numeric_keys(client), PIPELINE_BATCH_SIZE):
         pipe = client.pipeline(transaction=False)
         for key in key_batch:
@@ -132,11 +197,17 @@ def collect_discharging_off_imeis(client: redis.Redis) -> list[str]:
         values = pipe.execute()
 
         for key, raw in zip(key_batch, values):
-            if extract_bms_allow_discharging(raw) is False:
+            if extract_bms_allow_discharging(raw) is not False:
+                continue
+            soc = extract_soc(raw)
+            if soc == 0:
+                skipped_soc_zero_imeis.append(key)
+            else:
                 off_imeis.append(key)
 
     off_imeis.sort()
-    return off_imeis
+    skipped_soc_zero_imeis.sort()
+    return off_imeis, skipped_soc_zero_imeis
 
 
 def parse_csv_timestamp(raw: str) -> datetime | None:
@@ -155,6 +226,18 @@ def parse_csv_timestamp(raw: str) -> datetime | None:
     return None
 
 
+def parse_min_created_at(raw: str) -> datetime:
+    ts = parse_csv_timestamp(raw)
+    if ts is None:
+        raise ValueError(
+            "Invalid COMMAND_REQUEST_MIN_CREATED_AT. Use ISO format like "
+            "2026-06-30T18:29:59Z"
+        )
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=IST)
+    return ts
+
+
 def load_command_log(path: Path) -> dict[str, datetime]:
     if not path.exists():
         return {}
@@ -165,8 +248,8 @@ def load_command_log(path: Path) -> dict[str, datetime]:
         if not reader.fieldnames:
             return log
         for row in reader:
-            imei = (row.get("imei") or "").strip()
-            ts_raw = (row.get("timestamp") or "").strip()
+            imei = normalize_imei(row.get("imei"))
+            ts_raw = normalize_imei(row.get("timestamp"))
             if not imei:
                 continue
             ts = parse_csv_timestamp(ts_raw)
@@ -189,6 +272,93 @@ def save_command_log(path: Path, log: dict[str, datetime]) -> None:
             writer.writerow([imei, format_ist(log[imei])])
 
     tmp_path.replace(path)
+
+
+def append_fired_command_rows(path: Path, rows: list[tuple[str, str]]) -> None:
+    """Append rows to fired command CSV: (imei, set_timestamp_ist)."""
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = path.exists()
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        if not file_exists or path.stat().st_size == 0:
+            writer.writerow(FIRED_COMMAND_COLUMNS)
+        writer.writerows(rows)
+
+
+def load_override_imeis(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+
+    override_imeis: set[str] = set()
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            return override_imeis
+        for row in reader:
+            imei = normalize_imei(row.get("imei"))
+            if imei:
+                override_imeis.add(imei)
+    return override_imeis
+
+
+def log_filtered_imeis(label: str, imeis: list[str]) -> None:
+    if not imeis:
+        return
+    print(f"{label}_imeis={','.join(imeis)}", flush=True)
+
+
+def log_override_entries(override_imeis: set[str]) -> None:
+    if not override_imeis:
+        print("override_csv_entries=none", flush=True)
+        return
+    sorted_imeis = sorted(override_imeis)
+    print(f"override_csv_entries_count={len(sorted_imeis)}", flush=True)
+    print(f"override_csv_entries_imeis={','.join(sorted_imeis)}", flush=True)
+
+
+def fetch_fleet_imeis(pg_conn: psycopg.Connection) -> set[str]:
+    query = """
+        SELECT DISTINCT io_t_device_imei
+        FROM fleets
+        WHERE io_t_device_imei IS NOT NULL
+          AND BTRIM(io_t_device_imei) <> '';
+    """
+    with pg_conn.cursor() as cur:
+        cur.execute(query)
+        return {normalize_imei(row[0]) for row in cur.fetchall() if normalize_imei(row[0])}
+
+
+def fetch_latest_discharging_false_imeis(
+    pg_conn: psycopg.Connection,
+    imeis: list[str],
+    min_created_at: datetime,
+) -> set[str]:
+    if not imeis:
+        return set()
+
+    query = """
+        WITH latest AS (
+            SELECT DISTINCT ON (imei)
+                imei,
+                command,
+                command_status,
+                created_at
+            FROM command_requests
+            WHERE imei = ANY(%s)
+            ORDER BY imei, created_at DESC NULLS LAST, id DESC
+        )
+        SELECT imei
+        FROM latest
+        WHERE LOWER(command) = 'discharging'
+          AND command_status = FALSE
+          AND created_at IS NOT NULL
+          AND created_at > %s;
+    """
+    with pg_conn.cursor() as cur:
+        cur.execute(query, (imeis, min_created_at))
+        return {normalize_imei(row[0]) for row in cur.fetchall() if normalize_imei(row[0])}
 
 
 def is_eligible(imei: str, log: dict[str, datetime], now: datetime) -> bool:
@@ -235,59 +405,100 @@ def resolve_device_type(client: redis.Redis, imei: str) -> str:
     return DEFAULT_DEVICE_TYPE
 
 
-def apply_set(client: redis.Redis, imei: str) -> bool:
+def apply_set(client: redis.Redis, imei: str) -> tuple[bool, str]:
     redis_key = f"discharging_{imei}"
     device_type = resolve_device_type(client, imei)
     value = build_discharging_payload(imei, device_type)
 
     if DRY_RUN:
         print(f"  DRY-RUN {redis_key} value={value}")
-        return True
+        return True, ""
 
     try:
+        set_ts = format_ist(now_ist())
         client.set(redis_key, value)
-        print(f"  SET {redis_key} at {format_ist(now_ist())}")
-        return True
+        print(f"  SET {redis_key} at {set_ts}")
+        return True, set_ts
     except redis.RedisError as exc:
         print(f"  FAILED {redis_key}: {exc}", file=sys.stderr)
-        return False
+        return False, ""
 
 
-def run_cycle(client: redis.Redis, command_log: dict[str, datetime]) -> dict[str, datetime]:
+def run_cycle(
+    redis_client: redis.Redis,
+    pg_conn: psycopg.Connection,
+    command_log: dict[str, datetime],
+    min_created_at: datetime,
+) -> dict[str, datetime]:
     cycle_start = now_ist()
     print(f"Cycle started at {format_ist(cycle_start)} (IST)", flush=True)
 
     try:
-        off_imeis = collect_discharging_off_imeis(client)
+        off_imeis, skipped_soc_zero_imeis = collect_discharging_off_imeis(redis_client)
     except redis.RedisError as exc:
         print(f"Redis scan failed: {exc}", file=sys.stderr)
         return command_log
 
+    override_imeis = load_override_imeis(OVERRIDE_CSV)
+    log_override_entries(override_imeis)
+    fleet_imeis = fetch_fleet_imeis(pg_conn)
+
+    override_filtered = [imei for imei in off_imeis if imei not in override_imeis]
+    skipped_override = len(off_imeis) - len(override_filtered)
+
+    fleets_filtered = [imei for imei in override_filtered if imei in fleet_imeis]
+    skipped_absent_fleets_imeis = [
+        imei for imei in override_filtered if imei not in fleet_imeis
+    ]
+    skipped_absent_fleets = len(override_filtered) - len(fleets_filtered)
+
+    latest_discharging_false = fetch_latest_discharging_false_imeis(
+        pg_conn, fleets_filtered, min_created_at
+    )
+    command_filtered = [imei for imei in fleets_filtered if imei not in latest_discharging_false]
+    skipped_latest_false_imeis = sorted(latest_discharging_false)
+    skipped_latest_false = len(fleets_filtered) - len(command_filtered)
+
     eligible: list[str] = []
     skipped_cooldown = 0
-    for imei in off_imeis:
+    for imei in command_filtered:
         if is_eligible(imei, command_log, cycle_start):
             eligible.append(imei)
         else:
             skipped_cooldown += 1
 
+    redis_discharging_off_total = len(off_imeis) + len(skipped_soc_zero_imeis)
+    after_soc_filter = len(off_imeis)
+
     print(
-        f"discharging_off={len(off_imeis)}, eligible={len(eligible)}, "
-        f"skipped_cooldown={skipped_cooldown}",
+        "redis_discharging_off_total="
+        f"{redis_discharging_off_total}, "
+        f"skipped_soc_zero={len(skipped_soc_zero_imeis)}, "
+        f"after_soc_filter={after_soc_filter}, "
+        f"skipped_override={skipped_override}, "
+        f"skipped_absent_fleets={skipped_absent_fleets}, "
+        f"skipped_latest_discharging_false={skipped_latest_false}, "
+        f"eligible={len(eligible)}, skipped_cooldown={skipped_cooldown}",
         flush=True,
     )
+    log_filtered_imeis("skipped_soc_zero", skipped_soc_zero_imeis)
+    log_filtered_imeis("skipped_absent_fleets", skipped_absent_fleets_imeis)
+    log_filtered_imeis("skipped_latest_discharging_false", skipped_latest_false_imeis)
 
     success = 0
     failed = 0
+    fired_command_rows: list[tuple[str, str]] = []
     for index, imei in enumerate(eligible, start=1):
         if _shutdown_requested:
             break
 
         print(f"[{index}/{len(eligible)}] IMEI {imei}")
-        if apply_set(client, imei):
+        ok, set_ts = apply_set(redis_client, imei)
+        if ok:
             success += 1
             if not DRY_RUN:
                 command_log[imei] = now_ist()
+                fired_command_rows.append((imei, set_ts))
         else:
             failed += 1
 
@@ -296,6 +507,7 @@ def run_cycle(client: redis.Redis, command_log: dict[str, datetime]) -> dict[str
 
     if not DRY_RUN and success > 0:
         save_command_log(COMMAND_LOG_CSV, command_log)
+        append_fired_command_rows(FIRED_COMMAND_CSV, fired_command_rows)
 
     label = "would set" if DRY_RUN else "set"
     print(
@@ -310,9 +522,17 @@ def main() -> int:
     signal.signal(signal.SIGTERM, request_shutdown)
     signal.signal(signal.SIGINT, request_shutdown)
 
+    try:
+        min_created_at = parse_min_created_at(COMMAND_REQUEST_MIN_CREATED_AT_RAW)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
     mode = "DRY-RUN" if DRY_RUN else "LIVE"
     print(f"keepONN starting — mode={mode}", flush=True)
     print(f"Command log: {COMMAND_LOG_CSV}", flush=True)
+    print(f"Override CSV: {OVERRIDE_CSV}", flush=True)
+    print(f"Command request lower bound: {min_created_at.isoformat()}", flush=True)
     print(
         f"Cooldown: {COOLDOWN_MINUTES} min, loop interval: {LOOP_INTERVAL_SEC}s",
         flush=True,
@@ -321,16 +541,35 @@ def main() -> int:
     command_log = load_command_log(COMMAND_LOG_CSV)
 
     while not _shutdown_requested:
-        client: redis.Redis | None = None
+        redis_client: redis.Redis | None = None
+        pg_conn: psycopg.Connection | None = None
         try:
-            client = connect_redis()
-            client.ping()
-            command_log = run_cycle(client, command_log)
+            print(
+                f"Connecting Redis at {REDIS_HOST}:{REDIS_PORT} db={REDIS_DB}...",
+                flush=True,
+            )
+            redis_client = connect_redis()
+            redis_client.ping()
+            print("Redis connection established.", flush=True)
+
+            print(
+                f"Connecting Postgres at {DB_POSTGRES_URL}:{DB_POSTGRES_PORT} "
+                f"db={DB_POSTGRES_DBNAME} user={DB_POSTGRES_USERNAME}...",
+                flush=True,
+            )
+            pg_conn = connect_postgres()
+            print("Postgres connection established.", flush=True)
+
+            command_log = run_cycle(redis_client, pg_conn, command_log, min_created_at)
         except redis.RedisError as exc:
             print(f"Redis connection failed: {exc}", file=sys.stderr)
+        except psycopg.Error as exc:
+            print(f"Postgres error: {exc}", file=sys.stderr)
         finally:
-            if client is not None:
-                client.close()
+            if redis_client is not None:
+                redis_client.close()
+            if pg_conn is not None:
+                pg_conn.close()
 
         if _shutdown_requested:
             break

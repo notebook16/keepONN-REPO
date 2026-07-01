@@ -1,0 +1,15 @@
+flowchart TD
+    scan[SCAN all numeric IMEI keys] --> off["discharging_off: bms_allow_discharging=false"]
+    off --> override{Present in override.csv?}
+    override -->|Yes| skipOverride[skipped_override]
+    override -->|No| fleets{Present in fleets.io_t_device_imei?}
+    fleets -->|No| skipFleets[skipped_absent_fleets]
+    fleets -->|Yes| cr{Latest command_requests is discharging false after cutoff?}
+    cr -->|Yes| skipCr[skipped_latest_discharging_false]
+    cr -->|No| check{In comman_log.csv?}
+    check -->|No| eligible[eligible — SET now]
+    check -->|Yes| age{"now - last_ts >= 10 min?"}
+    age -->|Yes| eligible
+    age -->|No| skip[skipped_cooldown — ignore]
+    eligible --> set["SET discharging_imei JSON status=pending"]
+    set --> csv[Upsert comman_log.csv with now]
