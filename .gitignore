@@ -2,7 +2,7 @@
 keeponn.env
 
 # Runtime data (command cooldown log)
-data/
+
 
 # Python
 .venv/
