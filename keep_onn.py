@@ -189,7 +189,8 @@ def extract_soc(raw: str | None) -> float | None:
 
 def collect_discharging_off_imeis(client: redis.Redis) -> tuple[list[str], list[str]]:
     off_imeis: list[str] = []
-    skipped_soc_zero_imeis: list[str] = []
+    # soc == 0 is no longer filtered out; we only track it for observability.
+    soc_zero_imeis: list[str] = []
     for key_batch in chunked(iter_numeric_keys(client), PIPELINE_BATCH_SIZE):
         pipe = client.pipeline(transaction=False)
         for key in key_batch:
@@ -199,15 +200,13 @@ def collect_discharging_off_imeis(client: redis.Redis) -> tuple[list[str], list[
         for key, raw in zip(key_batch, values):
             if extract_bms_allow_discharging(raw) is not False:
                 continue
-            soc = extract_soc(raw)
-            if soc == 0:
-                skipped_soc_zero_imeis.append(key)
-            else:
-                off_imeis.append(key)
+            off_imeis.append(key)
+            if extract_soc(raw) == 0:
+                soc_zero_imeis.append(key)
 
     off_imeis.sort()
-    skipped_soc_zero_imeis.sort()
-    return off_imeis, skipped_soc_zero_imeis
+    soc_zero_imeis.sort()
+    return off_imeis, soc_zero_imeis
 
 
 def parse_csv_timestamp(raw: str) -> datetime | None:
@@ -434,7 +433,7 @@ def run_cycle(
     print(f"Cycle started at {format_ist(cycle_start)} (IST)", flush=True)
 
     try:
-        off_imeis, skipped_soc_zero_imeis = collect_discharging_off_imeis(redis_client)
+        off_imeis, soc_zero_imeis = collect_discharging_off_imeis(redis_client)
     except redis.RedisError as exc:
         print(f"Redis scan failed: {exc}", file=sys.stderr)
         return command_log
@@ -467,21 +466,19 @@ def run_cycle(
         else:
             skipped_cooldown += 1
 
-    redis_discharging_off_total = len(off_imeis) + len(skipped_soc_zero_imeis)
-    after_soc_filter = len(off_imeis)
+    redis_discharging_off_total = len(off_imeis)
 
     print(
         "redis_discharging_off_total="
         f"{redis_discharging_off_total}, "
-        f"skipped_soc_zero={len(skipped_soc_zero_imeis)}, "
-        f"after_soc_filter={after_soc_filter}, "
+        f"soc_zero_observed={len(soc_zero_imeis)} (not filtered), "
         f"skipped_override={skipped_override}, "
         f"skipped_absent_fleets={skipped_absent_fleets}, "
         f"skipped_latest_discharging_false={skipped_latest_false}, "
         f"eligible={len(eligible)}, skipped_cooldown={skipped_cooldown}",
         flush=True,
     )
-    log_filtered_imeis("skipped_soc_zero", skipped_soc_zero_imeis)
+    log_filtered_imeis("soc_zero_observed", soc_zero_imeis)
     log_filtered_imeis("skipped_absent_fleets", skipped_absent_fleets_imeis)
     log_filtered_imeis("skipped_latest_discharging_false", skipped_latest_false_imeis)
 
