@@ -3,7 +3,7 @@
 keepONN daemon:
 1) Scan Redis numeric IMEI keys where bms_allow_discharging=false
 2) Filter out IMEIs present in override CSV
-3) Filter out IMEIs absent in fleets.io_t_device_imei
+3) Filter out IMEIs absent in inv_iots.imei
 4) Filter out IMEIs whose latest command_requests row is discharging + command_status=false
    with created_at newer than configured cutoff
 5) Apply cooldown via comman_log.csv and SET discharging_<imei> status=pending
@@ -317,12 +317,12 @@ def log_override_entries(override_imeis: set[str]) -> None:
     print(f"override_csv_entries_imeis={','.join(sorted_imeis)}", flush=True)
 
 
-def fetch_fleet_imeis(pg_conn: psycopg.Connection) -> set[str]:
+def fetch_inv_iot_imeis(pg_conn: psycopg.Connection) -> set[str]:
     query = """
-        SELECT DISTINCT io_t_device_imei
-        FROM fleets
-        WHERE io_t_device_imei IS NOT NULL
-          AND BTRIM(io_t_device_imei) <> '';
+        SELECT DISTINCT imei
+        FROM inv_iots
+        WHERE imei IS NOT NULL
+          AND BTRIM(imei) <> '';
     """
     with pg_conn.cursor() as cur:
         cur.execute(query)
@@ -440,23 +440,23 @@ def run_cycle(
 
     override_imeis = load_override_imeis(OVERRIDE_CSV)
     log_override_entries(override_imeis)
-    fleet_imeis = fetch_fleet_imeis(pg_conn)
+    inv_iot_imeis = fetch_inv_iot_imeis(pg_conn)
 
     override_filtered = [imei for imei in off_imeis if imei not in override_imeis]
     skipped_override = len(off_imeis) - len(override_filtered)
 
-    fleets_filtered = [imei for imei in override_filtered if imei in fleet_imeis]
-    skipped_absent_fleets_imeis = [
-        imei for imei in override_filtered if imei not in fleet_imeis
+    inv_iots_filtered = [imei for imei in override_filtered if imei in inv_iot_imeis]
+    skipped_absent_inv_iots_imeis = [
+        imei for imei in override_filtered if imei not in inv_iot_imeis
     ]
-    skipped_absent_fleets = len(override_filtered) - len(fleets_filtered)
+    skipped_absent_inv_iots = len(override_filtered) - len(inv_iots_filtered)
 
     latest_discharging_false = fetch_latest_discharging_false_imeis(
-        pg_conn, fleets_filtered, min_created_at
+        pg_conn, inv_iots_filtered, min_created_at
     )
-    command_filtered = [imei for imei in fleets_filtered if imei not in latest_discharging_false]
+    command_filtered = [imei for imei in inv_iots_filtered if imei not in latest_discharging_false]
     skipped_latest_false_imeis = sorted(latest_discharging_false)
-    skipped_latest_false = len(fleets_filtered) - len(command_filtered)
+    skipped_latest_false = len(inv_iots_filtered) - len(command_filtered)
 
     eligible: list[str] = []
     skipped_cooldown = 0
@@ -473,13 +473,13 @@ def run_cycle(
         f"{redis_discharging_off_total}, "
         f"soc_zero_observed={len(soc_zero_imeis)} (not filtered), "
         f"skipped_override={skipped_override}, "
-        f"skipped_absent_fleets={skipped_absent_fleets}, "
+        f"skipped_absent_inv_iots={skipped_absent_inv_iots}, "
         f"skipped_latest_discharging_false={skipped_latest_false}, "
         f"eligible={len(eligible)}, skipped_cooldown={skipped_cooldown}",
         flush=True,
     )
     log_filtered_imeis("soc_zero_observed", soc_zero_imeis)
-    log_filtered_imeis("skipped_absent_fleets", skipped_absent_fleets_imeis)
+    log_filtered_imeis("skipped_absent_inv_iots", skipped_absent_inv_iots_imeis)
     log_filtered_imeis("skipped_latest_discharging_false", skipped_latest_false_imeis)
 
     success = 0
