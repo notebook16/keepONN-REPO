@@ -4,8 +4,9 @@ keepONN daemon:
 1) Scan Redis numeric IMEI keys where bms_allow_discharging=false
 2) Filter out IMEIs present in override CSV
 3) Filter out IMEIs absent in inv_iots.imei
-4) Filter out IMEIs whose latest command_requests row is discharging + command_status=false
-   with created_at newer than configured cutoff
+4) Filter out IMEIs whose latest command_requests row (resolved via inv_iot_id ->
+   inv_iots.imei, since command_requests.imei is deprecated) is discharging +
+   command_status=false with created_at newer than configured cutoff
 5) Apply cooldown via comman_log.csv and SET discharging_<imei> status=pending
 """
 
@@ -337,16 +338,19 @@ def fetch_latest_discharging_false_imeis(
     if not imeis:
         return set()
 
+    # command_requests.imei is deprecated; resolve IMEI via the inv_iot_id
+    # foreign key against inv_iots instead.
     query = """
         WITH latest AS (
-            SELECT DISTINCT ON (imei)
-                imei,
-                command,
-                command_status,
-                created_at
-            FROM command_requests
-            WHERE imei = ANY(%s)
-            ORDER BY imei, created_at DESC NULLS LAST, id DESC
+            SELECT DISTINCT ON (i.imei)
+                i.imei AS imei,
+                cr.command,
+                cr.command_status,
+                cr.created_at
+            FROM command_requests cr
+            JOIN inv_iots i ON i.inv_iot_id = cr.inv_iot_id
+            WHERE i.imei = ANY(%s)
+            ORDER BY i.imei, cr.created_at DESC NULLS LAST, cr.id DESC
         )
         SELECT imei
         FROM latest
